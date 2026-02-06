@@ -19,7 +19,7 @@ import seaborn as sns
 from PIL import Image
 from tqdm import tqdm
 import h5py
-import optuna  # Required for hyperparameter tuning
+import optuna
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -29,7 +29,7 @@ sns.set_style("whitegrid")
 # ============================================
 # 0. CONFIGURATION & LOCAL SETUP
 # ============================================
-BASE_DIR = '/home/user1/krishnanand'
+BASE_DIR = '/home/krishnanand'
 
 # Check for NVIDIA GPU
 if not torch.cuda.is_available():
@@ -39,14 +39,21 @@ else:
     print(f"SUCCESS: NVIDIA GPU detected: {torch.cuda.get_device_name(0)}")
     DEVICE = torch.device("cuda")
 
+# --- RETFOUND REPO SETUP ---
+RETFOUND_REPO_PATH = os.path.join(BASE_DIR, 'RETFound_MAE')
+
+if not os.path.exists(RETFOUND_REPO_PATH):
+    sys.exit("File or model not found")
+
+sys.path.append(RETFOUND_REPO_PATH)
 try:
     import models_vit
 except ImportError:
     sys.exit("File or model not found")
 
 # --- HYPERPARAMETERS ---
-ENABLE_OPTUNA = True  # Set to True to run hyperparameter tuning
-OPTUNA_TRIALS = 10    # Number of trials to run
+ENABLE_OPTUNA = True
+OPTUNA_TRIALS = 10
 DEFAULT_LR = 0.0001
 DEFAULT_BATCH_SIZE = 16
 RETFOUND_WEIGHTS_PATH = os.path.join(BASE_DIR, 'RETFound_cfp_weights.pkl')
@@ -64,8 +71,10 @@ MODEL_SAVE_DIR = os.path.join(BASE_DIR, 'Model_Saved')
 os.makedirs(MODEL_SAVE_DIR, exist_ok=True)
 MODEL_SAVE_PATH = os.path.join(MODEL_SAVE_DIR, 'best_retfound_hybrid.pth')
 
-if not os.path.exists(TRAIN_IMG_ROOT) or not os.path.exists(TEST_IMG_ROOT):
-    sys.exit("Error: Image folders not found.")
+if not os.path.exists(TRAIN_IMG_ROOT):
+    sys.exit(f"Error: Training image folder not found at {TRAIN_IMG_ROOT}")
+if not os.path.exists(TEST_IMG_ROOT):
+    sys.exit(f"Error: Test image folder not found at {TEST_IMG_ROOT}")
 
 # ============================================
 # 2. UTILITY FUNCTIONS
@@ -110,16 +119,22 @@ class FocalLoss(nn.Module):
 class ViTHybrid(nn.Module):
     def __init__(self, num_classes, num_handcrafted_features, checkpoint_path=None):
         super(ViTHybrid, self).__init__()
+        # Load RETFound
         self.vit = models_vit.vit_large_patch16(num_classes=num_classes, drop_path_rate=0.1, global_pool=True)
-        self.vit.head = nn.Identity() # Remove head to fix dimensions
+        
+        # FIX 1: Remove head to avoid dimension mismatch
+        self.vit.head = nn.Identity() 
 
         if checkpoint_path and os.path.exists(checkpoint_path):
             print(f"Loading RETFound weights from {checkpoint_path}...")
             checkpoint = torch.load(checkpoint_path, map_location='cpu')
             checkpoint_model = checkpoint['model']
+            # Remove head weights from checkpoint
             for k in ['head.weight', 'head.bias']:
                 if k in checkpoint_model: del checkpoint_model[k]
             self.vit.load_state_dict(checkpoint_model, strict=False)
+        else:
+            print("WARNING: RETFound weights not found. Initializing with random weights.")
         
         vit_feature_dim = 1024
         self.manual_mlp = nn.Sequential(
@@ -132,8 +147,13 @@ class ViTHybrid(nn.Module):
         )
 
     def forward(self, images, handcrafted_features):
+        # FIX 2: Use forward_features to get raw embeddings
         img_feat = self.vit.forward_features(images)
-        if img_feat.dim() == 3: img_feat = img_feat[:, 0, :] # Extract CLS token
+        
+        # FIX 3: Extract CLS token if output is 3D sequence
+        if img_feat.dim() == 3: 
+            img_feat = img_feat[:, 0, :] 
+        
         man_feat = self.manual_mlp(handcrafted_features)
         return self.classifier(torch.cat([img_feat, man_feat], dim=1))
 
@@ -193,28 +213,23 @@ BEST_LR = DEFAULT_LR
 BEST_BS = DEFAULT_BATCH_SIZE
 
 def objective(trial):
-    # 1. Suggest Hyperparameters
     lr = trial.suggest_float('lr', 1e-5, 1e-3, log=True)
     batch_size = trial.suggest_categorical('batch_size', [8, 16])
     
-    # 2. Setup DataLoaders for this trial
     train_loader = DataLoader(HybridOcularDataset(train_df, TRAIN_IMG_ROOT, train_features_normalized, train_feature_indices, train_transform), 
                               batch_size=batch_size, shuffle=True, drop_last=True, num_workers=2)
     val_loader = DataLoader(HybridOcularDataset(val_df, TRAIN_IMG_ROOT, train_features_normalized, train_feature_indices, val_transform), 
                             batch_size=batch_size, num_workers=2)
     
-    # 3. Initialize Model
     model = ViTHybrid(len(known_classes), train_features_normalized.shape[1], checkpoint_path=RETFOUND_WEIGHTS_PATH).to(DEVICE)
     model.freeze_backbone()
     
     optimizer = optim.Adam(model.parameters(), lr=lr)
     criterion = FocalLoss(weight=class_weights)
     
-    # 4. Short Training Loop (3 Epochs)
     model.train()
-    limit_batches = 30 # Only run 30 batches per epoch to save time
-    
-    for epoch in range(2): # Run for 2 epochs
+    limit_batches = 30
+    for epoch in range(2):
         for i, (imgs, feats, lbs) in enumerate(train_loader):
             if i >= limit_batches: break
             imgs, feats, lbs = imgs.to(DEVICE), feats.to(DEVICE), lbs.to(DEVICE)
@@ -224,7 +239,6 @@ def objective(trial):
             loss.backward()
             optimizer.step()
             
-    # 5. Validation Accuracy
     model.eval()
     correct = 0
     total = 0
@@ -245,10 +259,7 @@ if ENABLE_OPTUNA:
     print("="*60)
     study = optuna.create_study(direction='maximize')
     study.optimize(objective, n_trials=OPTUNA_TRIALS)
-    
-    print("\nBest params found:")
-    print(study.best_params)
-    
+    print(f"\nBest params: {study.best_params}")
     BEST_LR = study.best_params['lr']
     BEST_BS = study.best_params['batch_size']
 else:
@@ -278,11 +289,13 @@ train_losses, val_losses, train_accs, val_accs = [], [], [], []
 for epoch in range(EPOCHS):
     if epoch == UNFREEZE_EPOCH:
         print(">>> Unfreezing RETFound backbone with 1e-6 LR")
+        torch.cuda.empty_cache()
         model.unfreeze_all()
         for pg in optimizer.param_groups: pg['lr'] = 1e-6
 
     model.train()
     r_loss, correct, total = 0, 0, 0
+    # FIX 4: Correct tqdm usage for epoch progress
     loop = tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}")
     
     for imgs, feats, lbs in loop:
@@ -357,6 +370,8 @@ df_test = df_test[df_test['labels'].isin(known_classes)]
 df_test['label_encoded'] = le.transform(df_test['labels'])
 
 test_features, test_filenames, _, _ = load_h5_features(TEST_FEATURES_H5)
+# FIX 5: ADDED MISSING TEST INDICES DICTIONARY
+test_feature_indices = {fname: idx for idx, fname in enumerate(test_filenames)}
 df_test = df_test[df_test['filename'].isin(test_filenames)]
 
 if os.path.exists(MODEL_SAVE_PATH):
@@ -377,6 +392,7 @@ if os.path.exists(MODEL_SAVE_PATH):
     with torch.no_grad():
         for images, features, labels in tqdm(test_loader):
             images, features, labels = images.to(DEVICE), features.to(DEVICE), labels.to(DEVICE)
+            # Standard & TTA
             out1 = model(images, features)
             out2 = model(TF.hflip(images), features)
             avg_prob = (F.softmax(out1, dim=1) + F.softmax(out2, dim=1)) / 2.0
@@ -391,5 +407,3 @@ if os.path.exists(MODEL_SAVE_PATH):
     plt.title('Confusion Matrix: RETFound Hybrid Model'); plt.show()
 else:
     print(f"Error: Saved model not found at {MODEL_SAVE_PATH}")
-
-    
