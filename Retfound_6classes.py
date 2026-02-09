@@ -28,7 +28,7 @@ sns.set_style("whitegrid")
 # ============================================
 # 0. CONFIGURATION & LOCAL SETUP
 # ============================================
-BASE_DIR = '/home/krishnanand'
+BASE_DIR = '/home/ncrai/krishnanand/6classes'
 
 # Check for NVIDIA GPU
 if not torch.cuda.is_available():
@@ -45,17 +45,18 @@ except ImportError:
     sys.exit("File or model not found")
 
 # --- HYPERPARAMETERS ---
-ENABLE_OPTUNA = True
+ENABLE_OPTUNA = False
 OPTUNA_TRIALS = 10
-DEFAULT_LR = 0.0001
+DEFAULT_LR = 0.001  # Higher initial LR when using cosine decay
+DEFAULT_LR_MIN = 0.00001  # Minimum LR for cosine annealing
 DEFAULT_BATCH_SIZE = 16
 RETFOUND_WEIGHTS_PATH = os.path.join(BASE_DIR, 'RETFound_cfp_weights.pth')
 
 # ============================================
 # 1. PATHS
 # ============================================
-TRAIN_IMG_ROOT = os.path.join(BASE_DIR, 'Dataset/Preprocessed_Images/train')
-TEST_IMG_ROOT  = os.path.join(BASE_DIR, 'Dataset/Preprocessed_Images/test')
+TRAIN_IMG_ROOT = os.path.join(BASE_DIR, 'Dataset/train')
+TEST_IMG_ROOT  = os.path.join(BASE_DIR, 'Dataset/test')
 CSV_PATH = os.path.join(BASE_DIR, 'Dataset/train.csv')
 TEST_CSV_PATH = os.path.join(BASE_DIR, 'Dataset/test.csv')
 MODEL_SAVE_DIR = os.path.join(BASE_DIR, 'Model_Saved')
@@ -148,10 +149,13 @@ class FrozenRETFound(nn.Module):
             nn.Linear(vit_feature_dim, 512),
             nn.ReLU(),
             nn.Dropout(0.5),
-            nn.Linear(512, num_classes)
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, num_classes)
         )
         
-        print(f"✓ Trainable classifier initialized: {vit_feature_dim} → 512 → {num_classes}")
+        print(f"✓ Trainable classifier initialized: {vit_feature_dim} → 512 → 256 → {num_classes}")
 
     def train(self, mode=True):
         """
@@ -221,7 +225,7 @@ if not os.path.exists(CSV_PATH):
 df = pd.read_csv(CSV_PATH)
 df['labels'] = df['labels'].apply(clean_label)
 
-known_classes = ['N', 'D', 'G', 'C', 'A', 'H', 'M', 'O']
+known_classes = ['N', 'D', 'G', 'C', 'A', 'M'] 
 df = df[df['labels'].isin(known_classes)]
 
 le = LabelEncoder()
@@ -259,7 +263,7 @@ train_transform = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.RandomHorizontalFlip(),
     transforms.RandomRotation(15),
-    transforms.ColorJitter(brightness=0.2, contrast=0.2),
+    transforms.ColorJitter(brightness=0.1, contrast=0.1),  # Reduced to 0.1 for medical images
     transforms.ToTensor(),
     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
 ])
@@ -357,9 +361,11 @@ if ENABLE_OPTUNA:
     
     BEST_LR = study.best_params['lr']
     BEST_BS = study.best_params['batch_size']
+    USE_SCHEDULER = False  # Optuna handles LR, no scheduler needed
 else:
-    print("\nOptuna disabled. Using default hyperparameters.")
-    print(f"LR: {DEFAULT_LR}, Batch Size: {DEFAULT_BATCH_SIZE}")
+    print("\nOptuna disabled. Using default hyperparameters with cosine annealing.")
+    print(f"Initial LR: {DEFAULT_LR}, Min LR: {DEFAULT_LR_MIN}, Batch Size: {DEFAULT_BATCH_SIZE}")
+    USE_SCHEDULER = True  # Enable cosine annealing scheduler
 
 
 # ============================================
@@ -392,6 +398,12 @@ model = FrozenRETFound(
     checkpoint_path=RETFOUND_WEIGHTS_PATH
 ).to(DEVICE)
 
+# Training configuration
+EPOCHS = 200
+best_val_acc = 0.0
+patience_counter = 0
+patience_limit = 22
+
 # FIX 1: Only trainable parameters (classifier) in optimizer
 optimizer = optim.Adam(
     filter(lambda p: p.requires_grad, model.parameters()), 
@@ -399,11 +411,17 @@ optimizer = optim.Adam(
 )
 criterion = FocalLoss(weight=class_weights)
 
-# Training configuration
-EPOCHS = 120
-best_val_acc = 0.0
-patience_counter = 0
-patience_limit = 17
+# Cosine Annealing LR Scheduler (only when Optuna is disabled)
+if USE_SCHEDULER:
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, 
+        T_max=EPOCHS, 
+        eta_min=DEFAULT_LR_MIN
+    )
+    print(f"✓ Cosine Annealing LR Scheduler enabled: {BEST_LR} → {DEFAULT_LR_MIN}")
+else:
+    scheduler = None
+    print(f"✓ Using fixed LR from Optuna: {BEST_LR}")
 
 train_losses, val_losses, train_accs, val_accs = [], [], [], []
 
@@ -473,9 +491,17 @@ for epoch in range(EPOCHS):
     val_losses.append(val_loss)
     val_accs.append(val_acc)
     
+    # Get current learning rate
+    current_lr = optimizer.param_groups[0]['lr']
+    
     print(f"Epoch {epoch+1}/{EPOCHS}: "
           f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f} | "
-          f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
+          f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f} | "
+          f"LR: {current_lr:.6f}")
+    
+    # Step the scheduler if enabled
+    if scheduler is not None:
+        scheduler.step()
     
     # ============================================
     # MODEL CHECKPOINTING
